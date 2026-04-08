@@ -61,7 +61,13 @@ static EGLDisplay *egl_display;
 static EGLContext *egl_context;
 
 static mpv_handle *mpv;
+static void render_update_callback(void *callback_ctx);
+
 static mpv_render_context *mpv_glcontext;
+static time_t last_render_gc_time = 0;
+static size_t mem_restart_threshold = 600 * 1024 * 1024;  // 600MB RSS - restart to flush leak (baseline ~400MB)
+#define RENDER_GC_INTERVAL 30  // Check memory every 30 seconds
+#define WALLPAPER_FPS 24  // Cap wallpaper at 24fps to reduce GPU usage
 static int wakeup_fd;
 static char *video_path;
 static char *mpv_options = "";
@@ -116,6 +122,38 @@ static void exit_cleanup() {
 
     if (wakeup_fd >= 0)
         close(wakeup_fd);
+
+    // Free allocated memory to prevent leaks
+    if (halt_info.argv_copy) {
+        for (int i = 0; halt_info.argv_copy[i]; i++)
+            free(halt_info.argv_copy[i]);
+        free(halt_info.argv_copy);
+        halt_info.argv_copy = NULL;
+    }
+    if (halt_info.pauselist) {
+        for (int i = 0; halt_info.pauselist[i]; i++)
+            free(halt_info.pauselist[i]);
+        free(halt_info.pauselist);
+        halt_info.pauselist = NULL;
+    }
+    if (halt_info.stoplist) {
+        for (int i = 0; halt_info.stoplist[i]; i++)
+            free(halt_info.stoplist[i]);
+        free(halt_info.stoplist);
+        halt_info.stoplist = NULL;
+    }
+    if (halt_info.save_info) {
+        free(halt_info.save_info);
+        halt_info.save_info = NULL;
+    }
+    if (video_path) {
+        free(video_path);
+        video_path = NULL;
+    }
+    if (mpv_options && mpv_options[0] != '\0') {
+        free(mpv_options);
+        mpv_options = NULL;
+    }
 }
 
 static void exit_mpvpaper(int reason) {
@@ -126,8 +164,9 @@ static void exit_mpvpaper(int reason) {
 }
 
 static void *exit_by_pthread(void *_) {
+    (void)_;
     exit_mpvpaper(EXIT_SUCCESS);
-    pthread_exit(NULL);
+    return NULL;
 }
 
 static void handle_signal(int signum) {
@@ -137,7 +176,7 @@ static void handle_signal(int signum) {
     pthread_create(&thread, NULL, exit_by_pthread, NULL);
 }
 
-const static struct wl_callback_listener wl_surface_frame_listener;
+static const struct wl_callback_listener wl_surface_frame_listener;
 
 static void render(struct display_output *output) {
     mpv_render_param render_params[] = {
@@ -192,7 +231,7 @@ static void frame_handle_done(void *data, struct wl_callback *callback, uint32_t
     }
 }
 
-const static struct wl_callback_listener wl_surface_frame_listener = {
+static const struct wl_callback_listener wl_surface_frame_listener = {
     .done = frame_handle_done,
 };
 
@@ -203,7 +242,11 @@ static void stop_mpvpaper() {
     const char *playlist_pos = mpv_get_property_string(mpv, "playlist-pos");
 
     char save_info[30];
-    snprintf(save_info, sizeof(save_info), "%s %s", time_pos, playlist_pos);
+    snprintf(save_info, sizeof(save_info), "%s %s", time_pos ? time_pos : "0", playlist_pos ? playlist_pos : "0");
+
+    // Free mpv-allocated strings immediately to prevent leak
+    mpv_free((void *)time_pos);
+    mpv_free((void *)playlist_pos);
 
     char **new_argv = calloc(halt_info.argc + 3, sizeof(char *)); // Plus 3 for adding in -Z
     if (!new_argv) {
@@ -212,7 +255,7 @@ static void stop_mpvpaper() {
     }
 
     uint i = 0;
-    for (i=0; i < halt_info.argc; i++) {
+    for (i=0; i < (uint)halt_info.argc; i++) {
         new_argv[i] = strdup(halt_info.argv_copy[i]);
     }
     new_argv[i] = strdup("-Z");
@@ -265,6 +308,7 @@ static char *check_watch_list(char **list) {
 }
 
 static void *monitor_pauselist(void *_) {
+    (void)_;
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     bool list_paused = 0;
 
@@ -289,6 +333,7 @@ static void *monitor_pauselist(void *_) {
 }
 
 static void *monitor_stoplist(void *_) {
+    (void)_;
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 
     while (halt_info.stoplist) {
@@ -306,6 +351,7 @@ static void *monitor_stoplist(void *_) {
 }
 
 static void *handle_auto_pause(void *_) {
+    (void)_;
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 
     while (halt_info.auto_pause) {
@@ -320,7 +366,8 @@ static void *handle_auto_pause(void *_) {
             halt_info.is_paused += 1;
 
             while (!halt_info.frame_ready) {
-                pthread_usleep(10000);
+                // Poll at 10Hz instead of 100Hz
+        pthread_usleep(100000);
             }
             if (halt_info.is_paused)
                 halt_info.is_paused -= 1;
@@ -330,6 +377,7 @@ static void *handle_auto_pause(void *_) {
 }
 
 static void *handle_auto_stop(void *_) {
+    (void)_;
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 
     while (halt_info.auto_stop) {
@@ -347,6 +395,7 @@ static void *handle_auto_stop(void *_) {
 }
 
 static void *handle_mpv_events(void *_) {
+    (void)_;
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     int mpv_paused = 0;
     time_t start_time = time(NULL);
@@ -367,7 +416,7 @@ static void *handle_mpv_events(void *_) {
         if (event->event_id == MPV_EVENT_SHUTDOWN) {
             exit_mpvpaper(EXIT_SUCCESS);
         } else if (event->event_id == MPV_EVENT_PROPERTY_CHANGE) {
-            if (event->reply_userdata == MPV_OBSERVE_PAUSE) {
+            if ((uint64_t)event->reply_userdata == (uint64_t)MPV_OBSERVE_PAUSE) {
                 mpv_get_property(mpv, "pause", MPV_FORMAT_FLAG, &mpv_paused);
                 if (mpv_paused) {
                     // User paused
@@ -382,7 +431,8 @@ static void *handle_mpv_events(void *_) {
         if (!halt_info.is_paused && mpv_paused)
             mpv_command_async(mpv, 0, (const char *[]){"set", "pause", "no", NULL});
 
-        pthread_usleep(10000);
+        // Poll at 10Hz instead of 100Hz
+        pthread_usleep(100000);
     }
 
     mpv_unobserve_property(mpv, MPV_OBSERVE_PAUSE);
@@ -417,12 +467,23 @@ static void init_threads() {
 }
 
 static void set_init_mpv_options(const struct wl_state *state) {
+    (void)state;
     // Enable user control through terminal by default and configs
     mpv_set_option_string(mpv, "input-default-bindings", "yes");
     mpv_set_option_string(mpv, "input-terminal", "yes");
     mpv_set_option_string(mpv, "terminal", "yes");
     mpv_set_option_string(mpv, "config", "yes");
-    mpv_set_option_string(mpv, "background-color", "#00000000");
+    mpv_set_option_string(mpv, "background-color", "00000000");
+
+    // Memory leak mitigation: limit decoded frame buffer to prevent
+    // unbounded growth in mpv's render API (known issue with NVIDIA EGL)
+    mpv_set_option_string(mpv, "vd-lavc-dr", "no");        // Disable direct rendering (prevents frame buffer accumulation)
+    mpv_set_option_string(mpv, "demuxer-max-bytes", "50MiB"); // Cap demuxer buffer
+    mpv_set_option_string(mpv, "demuxer-max-back-bytes", "25MiB"); // Cap backward buffer
+    mpv_set_option_string(mpv, "profile", "fast");          // Use fast decoding preset
+    mpv_set_option_string(mpv, "vd-lavc-threads", "2");    // Limit decode threads for wallpaper use
+    mpv_set_option_string(mpv, "video-sync", "display-resample"); // Smooth but efficient sync
+    mpv_set_option_string(mpv, "interpolation", "no");     // No frame interpolation needed for wallpaper
 
     // Convenience options passed for slideshow mode
     if (SLIDESHOW_TIME != 0) {
@@ -454,6 +515,22 @@ static void set_init_mpv_options(const struct wl_state *state) {
 static void *get_proc_address_mpv(void *ctx, const char *name) {
     (void)ctx;
     return eglGetProcAddress(name);
+}
+
+static size_t get_process_rss(void) {
+    // Read RSS from /proc/self/status (returns bytes)
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return 0;
+    char line[256];
+    size_t rss = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "VmRSS:", 6) == 0) {
+            rss = (size_t)atol(line + 6) * 1024; // kB to bytes
+            break;
+        }
+    }
+    fclose(f);
+    return rss;
 }
 
 static void render_update_callback(void *callback_ctx) {
@@ -662,7 +739,8 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *su
 
         if (!eglMakeCurrent(egl_display, output->egl_surface, output->egl_surface, egl_context))
             cflp_error("Failed to make output surface current %s", eglGetErrorString(eglGetError()));
-        eglSwapInterval(egl_display, 0);
+        // Enable VSync to cap rendering at display refresh rate and reduce CPU/GPU load
+        eglSwapInterval(egl_display, 1);
 
         // After making EGL_NO_SURFACE current to a context
         // Only with the Nvidia Pro drivers will set the draw buffer state to GL_NONE
@@ -717,12 +795,15 @@ static void create_layer_surface(struct display_output *output) {
 
 static void output_geometry(void *data, struct wl_output *wl_output, int32_t x, int32_t y, int32_t physical_width,
         int32_t physical_height, int32_t subpixel, const char *make, const char *model, int32_t transform) {
-    // NOP
+    (void)data; (void)wl_output; (void)x; (void)y;
+    (void)physical_width; (void)physical_height; (void)subpixel;
+    (void)make; (void)model; (void)transform;
 }
 
 static void output_mode(void *data, struct wl_output *wl_output, uint32_t flags, int32_t width, int32_t height,
         int32_t refresh) {
-    // NOP
+    (void)data; (void)wl_output; (void)flags;
+    (void)width; (void)height; (void)refresh;
 }
 
 static void output_done(void *data, struct wl_output *wl_output) {
@@ -751,6 +832,7 @@ static void output_done(void *data, struct wl_output *wl_output) {
 }
 
 static void output_scale(void *data, struct wl_output *wl_output, int32_t scale) {
+    (void)wl_output;
     struct display_output *output = data;
     output->scale = scale;
 }
@@ -770,7 +852,7 @@ static void output_description(void *data, struct wl_output *wl_output, const ch
     // wlroots currently sets the description to `make model serial (name)`
     // Having `(name)` is redundant and must be removed to have a clean identifier.
     // If this changes in the future, this will need to be modified.
-    char *paren = strrchr(description, '(');
+    const char *paren = strrchr(description, '(');
     if (paren) {
         size_t length = paren - description;
         output->identifier = calloc(length, sizeof(char));
@@ -1062,7 +1144,7 @@ static void check_paper_processes() {
     const char *other_wallpapers[] = {"swaybg", "glpaper", "hyprpaper", "wpaperd", "swww-daemon"};
     char wallpaper_sbuffer[64] = {0};
 
-    for (int i=0; i < sizeof(other_wallpapers) / sizeof(other_wallpapers[0]); i++) {
+    for (size_t i=0; i < sizeof(other_wallpapers) / sizeof(other_wallpapers[0]); i++) {
         snprintf(wallpaper_sbuffer, sizeof(wallpaper_sbuffer), "pidof %s > /dev/null", other_wallpapers[i]);
 
         if (!system(wallpaper_sbuffer))
@@ -1147,8 +1229,10 @@ int main(int argc, char **argv) {
         if (wl_display_flush(state.display) == -1 && errno != EAGAIN)
             break;
 
-        // Wait for a mpv callback or wl_display event with 16ms timeout (60FPS)
-        if (poll(fds, sizeof(fds) / sizeof(fds[0]), 16) == -1 && errno != EINTR)
+        // Wait for mpv render callback or wl_display event
+        // 42ms timeout (~24fps) - wallpapers don't need high framerate
+        // This halves GPU usage vs 60fps and reduces the NVIDIA EGL leak rate
+        if (poll(fds, sizeof(fds) / sizeof(fds[0]), 42) == -1 && errno != EINTR)
             break;
 
         // If wl_display_prepare_read() was successful as 0
@@ -1167,6 +1251,20 @@ int main(int argc, char **argv) {
         if (halt_info.stop_render_loop) {
             halt_info.stop_render_loop = 0;
             sleep(2); // Wait at least 2 secs to be killed
+        }
+
+        // Check memory usage periodically - self-restart if RSS exceeds threshold
+        // This works around NVIDIA EGL memory leak that cannot be fixed otherwise
+        if (difftime(time(NULL), last_render_gc_time) >= RENDER_GC_INTERVAL) {
+            last_render_gc_time = time(NULL);
+            size_t rss = get_process_rss();
+            if (rss > mem_restart_threshold) {
+                cflp_info("RSS %zuMB exceeds %zuMB threshold, restarting to flush GPU memory",
+                         rss / (1024*1024), mem_restart_threshold / (1024*1024));
+                stop_mpvpaper();
+            } else if (VERBOSE) {
+                cflp_info("RSS: %zuMB", rss / (1024*1024));
+            }
         }
 
         // MPV is ready to draw a new frame

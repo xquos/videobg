@@ -97,7 +97,7 @@ static struct wl_buffer *create_dummy_buffer(struct display_output *output) {
     return buffer;
 }
 
-const static struct wl_callback_listener wl_surface_frame_listener;
+static const struct wl_callback_listener wl_surface_frame_listener;
 
 static void create_surface_frame(struct display_output *output) {
 
@@ -129,7 +129,7 @@ static void frame_handle_done(void *data, struct wl_callback *callback, uint32_t
     create_surface_frame(data);
 }
 
-const static struct wl_callback_listener wl_surface_frame_listener = {
+static const struct wl_callback_listener wl_surface_frame_listener = {
     .done = frame_handle_done,
 };
 
@@ -197,12 +197,15 @@ static void create_layer_surface(struct display_output *output) {
 
 static void output_geometry(void *data, struct wl_output *wl_output, int32_t x, int32_t y, int32_t physical_width,
         int32_t physical_height, int32_t subpixel, const char *make, const char *model, int32_t transform) {
-    // NOP
+    (void)data; (void)wl_output; (void)x; (void)y;
+    (void)physical_width; (void)physical_height; (void)subpixel;
+    (void)make; (void)model; (void)transform;
 }
 
 static void output_mode(void *data, struct wl_output *wl_output, uint32_t flags, int32_t width, int32_t height,
         int32_t refresh) {
-    // NOP
+    (void)data; (void)wl_output; (void)flags;
+    (void)width; (void)height; (void)refresh;
 }
 
 static void output_done(void *data, struct wl_output *wl_output) {
@@ -223,7 +226,7 @@ static void output_done(void *data, struct wl_output *wl_output) {
 }
 
 static void output_scale(void *data, struct wl_output *wl_output, int32_t scale) {
-    // NOP
+    (void)data; (void)wl_output; (void)scale;
 }
 
 static void output_name(void *data, struct wl_output *wl_output, const char *name) {
@@ -238,7 +241,7 @@ static void output_description(void *data, struct wl_output *wl_output, const ch
 
     struct display_output *output = data;
 
-    char *paren = strrchr(description, '(');
+    const char *paren = strrchr(description, '(');
     if (paren) {
         size_t length = paren - description;
         output->identifier = calloc(length, sizeof(char));
