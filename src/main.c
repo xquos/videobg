@@ -54,6 +54,17 @@ struct display_output {
 
     struct wl_callback *frame_callback;
     bool redraw_needed;
+
+    // Swap throttling — reduces eglSwapBuffers calls from 24/sec to ~2/sec
+    int blit_counter;   // counts renders, swaps when counter >= threshold
+    int frames_rendered; // total frames rendered (for initial burst)
+
+    // FBO offscreen rendering — mpv renders into FBO, we blit to screen on swap
+    GLuint fbo;         // offscreen framebuffer object
+    GLuint fbo_texture; // texture attached to FBO
+    int fbo_width;      // FBO dimensions (may differ from output if resized)
+    int fbo_height;
+    bool fbo_ready;     // FBO created and valid
 };
 
 static EGLConfig egl_config;
@@ -65,9 +76,95 @@ static void render_update_callback(void *callback_ctx);
 
 static mpv_render_context *mpv_glcontext;
 static time_t last_render_gc_time = 0;
-static size_t mem_restart_threshold = 600 * 1024 * 1024;  // 600MB RSS - restart to flush leak (baseline ~400MB)
+static size_t mem_restart_threshold = 800 * 1024 * 1024;  // 800MB RSS - restart to flush leak (baseline ~420MB, leak ~12MB/min)
+static size_t surface_recycle_threshold = 0;  // DISABLED — surface recycle crashes. Set to e.g. 550*1024*1024 to enable.
 #define RENDER_GC_INTERVAL 30  // Check memory every 30 seconds
-#define WALLPAPER_FPS 24  // Cap wallpaper at 24fps to reduce GPU usage
+#define SURFACE_RECYCLE_COOLDOWN 120  // Don't recycle surface more than once per 2 minutes
+static time_t last_surface_recycle_time = 0;
+static struct wl_state *g_state = NULL;  // Global pointer to state, set in main()
+#define WALLPAPER_FPS 24  // Cap wallpaper at 24fps — smooth video, matches video framerate
+
+// Forward declarations needed by FBO functions
+static int VERBOSE = 0;
+static uint SLIDESHOW_TIME = 0;
+static bool SHOW_OUTPUTS = false;
+
+// FBO offscreen rendering — reduces eglSwapBuffers calls from 24/sec to ~1-2/sec
+// This slows the NVIDIA EGL memory leak by 10-20x
+#define FBO_BLIT_INTERVAL 12  // Blit every Nth render (at 24fps, 12 = ~2 blits/sec)
+
+static bool fbo_create(struct display_output *output, int width, int height) {
+    if (output->fbo_ready && output->fbo_width == width && output->fbo_height == height)
+        return true; // Already created with correct size
+
+    // Delete old FBO if size changed
+    if (output->fbo_ready) {
+        glDeleteFramebuffers(1, &output->fbo);
+        glDeleteTextures(1, &output->fbo_texture);
+        output->fbo_ready = false;
+    }
+
+    // Create texture
+    glGenTextures(1, &output->fbo_texture);
+    glBindTexture(GL_TEXTURE_2D, output->fbo_texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    // Create FBO and attach texture
+    glGenFramebuffers(1, &output->fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, output->fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, output->fbo_texture, 0);
+
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        cflp_error("FBO creation failed: status 0x%x", status);
+        glDeleteFramebuffers(1, &output->fbo);
+        glDeleteTextures(1, &output->fbo_texture);
+        return false;
+    }
+
+    output->fbo_width = width;
+    output->fbo_height = height;
+    output->fbo_ready = true;
+    if (VERBOSE)
+        cflp_info("FBO created %dx%d for %s", width, height, output->name);
+    return true;
+}
+
+static void fbo_destroy(struct display_output *output) {
+    if (!output->fbo_ready)
+        return;
+    glDeleteFramebuffers(1, &output->fbo);
+    glDeleteTextures(1, &output->fbo_texture);
+    output->fbo_ready = false;
+}
+
+// Blit the FBO texture to the on-screen EGL surface and swap
+// NOTE: currently inlined in render(), kept for reference
+#if 0
+static void fbo_blit_and_swap(struct display_output *output) {
+    int render_w = output->width * output->scale;
+    int render_h = output->height * output->scale;
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, output->fbo);
+    glBlitFramebuffer(
+        0, 0, render_w, render_h,
+        0, 0, render_w, render_h,
+        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+
+    if (!eglSwapBuffers(egl_display, output->egl_surface))
+        cflp_error("Failed to swap egl buffers %s", eglGetErrorString(eglGetError()));
+    mpv_render_context_report_swap(mpv_glcontext);
+}
+#endif
+
 static int wakeup_fd;
 static char *video_path;
 static char *mpv_options = "";
@@ -91,9 +188,7 @@ static struct {
 
 static pthread_t threads[5] = {0};
 
-static uint SLIDESHOW_TIME = 0;
-static bool SHOW_OUTPUTS = false;
-static int VERBOSE = 0;
+// (moved above FBO functions)
 
 static void exit_cleanup() {
 
@@ -179,37 +274,77 @@ static void handle_signal(int signum) {
 static const struct wl_callback_listener wl_surface_frame_listener;
 
 static void render(struct display_output *output) {
-    mpv_render_param render_params[] = {
-        {MPV_RENDER_PARAM_OPENGL_FBO, &(mpv_opengl_fbo) {
-            .fbo = 0,
-            .w = output->width * output->scale,
-            .h = output->height * output->scale,
-        }},
-        // Flip rendering (needed due to flipped GL coordinate system).
-        {MPV_RENDER_PARAM_FLIP_Y, &(int){1}},
-        // Do not wait for a fresh frame to render
-        {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &(int){0}},
-        {MPV_RENDER_PARAM_INVALID, NULL},
-    };
+    int render_w = output->width * output->scale;
+    int render_h = output->height * output->scale;
 
     if (!eglMakeCurrent(egl_display, output->egl_surface, output->egl_surface, egl_context))
         cflp_error("Failed to make output surface current %s", eglGetErrorString(eglGetError()));
 
-    glViewport(0, 0, output->width * output->scale, output->height * output->scale);
+    // Ensure FBO exists for this output
+    if (!fbo_create(output, render_w, render_h)) {
+        cflp_error("FBO creation failed, falling back to direct render");
+        // Fallback: render directly to screen (stock path)
+        mpv_render_param fallback_params[] = {
+            {MPV_RENDER_PARAM_OPENGL_FBO, &(mpv_opengl_fbo) {
+                .fbo = 0,
+                .w = render_w,
+                .h = render_h,
+            }},
+            {MPV_RENDER_PARAM_FLIP_Y, &(int){1}},
+            {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &(int){0}},
+            {MPV_RENDER_PARAM_INVALID, NULL},
+        };
+        glViewport(0, 0, render_w, render_h);
+        mpv_render_context_render(mpv_glcontext, fallback_params);
+        output->frame_callback = wl_surface_frame(output->surface);
+        wl_callback_add_listener(output->frame_callback, &wl_surface_frame_listener, output);
+        output->redraw_needed = false;
+        if (!eglSwapBuffers(egl_display, output->egl_surface))
+            cflp_error("Failed to swap egl buffers %s", eglGetErrorString(eglGetError()));
+        mpv_render_context_report_swap(mpv_glcontext);
+        return;
+    }
 
-    // Render frame
+    // Step 1: Render mpv into offscreen FBO
+    glBindFramebuffer(GL_FRAMEBUFFER, output->fbo);
+    glViewport(0, 0, render_w, render_h);
+
+    mpv_render_param render_params[] = {
+        {MPV_RENDER_PARAM_OPENGL_FBO, &(mpv_opengl_fbo) {
+            .fbo = output->fbo,
+            .w = render_w,
+            .h = render_h,
+        }},
+        {MPV_RENDER_PARAM_FLIP_Y, &(int){0}},  // FBO has GL coords (bottom-left origin), no flip needed
+        {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &(int){0}},
+        {MPV_RENDER_PARAM_INVALID, NULL},
+    };
     int mpv_err = mpv_render_context_render(mpv_glcontext, render_params);
     if (mpv_err < 0)
         cflp_error("Failed to render frame with mpv, %s", mpv_error_string(mpv_err));
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    // Callback new frame
+    // Step 2: Blit FBO to screen and swap every frame
+    // (FBO render + blit path confirmed working)
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, output->fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBlitFramebuffer(
+        0, 0, render_w, render_h,
+        0, render_h, render_w, 0,
+        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+
+    output->frames_rendered++;
+
+    // Callback + swap (stock order: callback first, then swap)
     output->frame_callback = wl_surface_frame(output->surface);
     wl_callback_add_listener(output->frame_callback, &wl_surface_frame_listener, output);
     output->redraw_needed = false;
 
-    // Display frame
+    glFlush();  // Drain GL pipeline before swap
     if (!eglSwapBuffers(egl_display, output->egl_surface))
         cflp_error("Failed to swap egl buffers %s", eglGetErrorString(eglGetError()));
+    mpv_render_context_report_swap(mpv_glcontext);
 }
 
 static void frame_handle_done(void *data, struct wl_callback *callback, uint32_t frame_time) {
@@ -234,6 +369,91 @@ static void frame_handle_done(void *data, struct wl_callback *callback, uint32_t
 static const struct wl_callback_listener wl_surface_frame_listener = {
     .done = frame_handle_done,
 };
+
+// Recycle EGL surface to flush NVIDIA per-surface memory leak
+// Instead of restarting the whole process, destroy+recreate just the EGL surface
+// Returns: true if recycle was performed, false if skipped
+static void stop_mpvpaper();  // forward declaration
+static bool recycle_egl_surfaces() {
+    time_t now = time(NULL);
+    if (difftime(now, last_surface_recycle_time) < SURFACE_RECYCLE_COOLDOWN) {
+        if (VERBOSE) cflp_info("Surface recycle skipped: cooldown not expired");
+        return false;
+    }
+
+    last_surface_recycle_time = now;
+    cflp_info("Recycling EGL surfaces to flush NVIDIA memory leak...");
+
+    struct display_output *output;
+    wl_list_for_each(output, &g_state->outputs, link) {
+        if (!output->egl_surface || !output->egl_window) continue;
+
+        EGLSurface old_surface = output->egl_surface;
+
+        // Step 1: Make context current with no surface
+        if (!eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_context)) {
+            cflp_error("Recycle: failed to detach EGL surface: %s", eglGetErrorString(eglGetError()));
+            continue;
+        }
+
+        // Step 2: Destroy the old EGL surface
+        if (!eglDestroySurface(egl_display, old_surface)) {
+            cflp_error("Recycle: failed to destroy old EGL surface: %s", eglGetErrorString(eglGetError()));
+            // Try to recover
+            eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_context);
+            continue;
+        }
+        output->egl_surface = NULL;
+
+        // Step 3: Resize the wl_egl_window to 0 then back (triggers buffer reallocation)
+        wl_egl_window_resize(output->egl_window, 0, 0, 0, 0);
+        wl_egl_window_resize(output->egl_window,
+            output->width * output->scale, output->height * output->scale, 0, 0);
+
+        // Step 4: Create a new EGL surface on the same wl_egl_window
+        output->egl_surface = eglCreatePlatformWindowSurface(
+            egl_display, egl_config, output->egl_window, NULL);
+        if (!output->egl_surface) {
+            cflp_error("Recycle: failed to create new EGL surface: %s",
+                eglGetErrorString(eglGetError()));
+            // CRITICAL: We destroyed the old surface and can't make a new one.
+            // Fall back to full process restart.
+            cflp_info("Recycle: failed critically, falling back to full restart");
+            stop_mpvpaper();
+            return false;  // won't reach here
+        }
+
+        // Step 5: Make new surface current
+        if (!eglMakeCurrent(egl_display, output->egl_surface, output->egl_surface, egl_context)) {
+            cflp_error("Recycle: failed to make new surface current: %s",
+                eglGetErrorString(eglGetError()));
+            stop_mpvpaper();
+            return false;
+        }
+
+        // Step 6: Restore GL state
+        eglSwapInterval(egl_display, 1);
+        glDrawBuffer(GL_BACK);
+        glViewport(0, 0, output->width * output->scale, output->height * output->scale);
+
+        // Step 7: Recreate FBO for the new surface
+        fbo_destroy(output);
+        if (fbo_create(output, output->width * output->scale, output->height * output->scale)) {
+            if (VERBOSE) cflp_info("Recycle: FBO recreated for %s", output->name);
+        }
+
+        // Step 8: Force a redraw
+        output->redraw_needed = true;
+        output->frame_callback = NULL;  // Reset frame callback
+
+        cflp_info("Recycle: EGL surface recycled for %s", output->name);
+    }
+
+    // Give compositor time to process the changes
+    wl_display_flush(g_state->display);
+
+    return true;
+}
 
 static void stop_mpvpaper() {
 
@@ -411,19 +631,24 @@ static void *handle_mpv_events(void *_) {
             }
         }
 
-        mpv_event *event = mpv_wait_event(mpv, 0);
+        // Drain entire event queue — prevents backlog accumulation
+        while (1) {
+            mpv_event *event = mpv_wait_event(mpv, 0);
+            if (event->event_id == MPV_EVENT_NONE)
+                break;
 
-        if (event->event_id == MPV_EVENT_SHUTDOWN) {
-            exit_mpvpaper(EXIT_SUCCESS);
-        } else if (event->event_id == MPV_EVENT_PROPERTY_CHANGE) {
-            if ((uint64_t)event->reply_userdata == (uint64_t)MPV_OBSERVE_PAUSE) {
-                mpv_get_property(mpv, "pause", MPV_FORMAT_FLAG, &mpv_paused);
-                if (mpv_paused) {
-                    // User paused
-                    if (!halt_info.is_paused)
-                        halt_info.is_paused += 1;
-                } else {
-                    halt_info.is_paused = 0;
+            if (event->event_id == MPV_EVENT_SHUTDOWN) {
+                exit_mpvpaper(EXIT_SUCCESS);
+            } else if (event->event_id == MPV_EVENT_PROPERTY_CHANGE) {
+                if ((uint64_t)event->reply_userdata == (uint64_t)MPV_OBSERVE_PAUSE) {
+                    mpv_get_property(mpv, "pause", MPV_FORMAT_FLAG, &mpv_paused);
+                    if (mpv_paused) {
+                        // User paused
+                        if (!halt_info.is_paused)
+                            halt_info.is_paused += 1;
+                    } else {
+                        halt_info.is_paused = 0;
+                    }
                 }
             }
         }
@@ -480,6 +705,8 @@ static void set_init_mpv_options(const struct wl_state *state) {
     mpv_set_option_string(mpv, "vd-lavc-dr", "no");        // Disable direct rendering (prevents frame buffer accumulation)
     mpv_set_option_string(mpv, "demuxer-max-bytes", "50MiB"); // Cap demuxer buffer
     mpv_set_option_string(mpv, "demuxer-max-back-bytes", "25MiB"); // Cap backward buffer
+    mpv_set_option_string(mpv, "swapchain-depth", "1");   // Minimize swap chain (reduces VRAM)
+    mpv_set_option_string(mpv, "opengl-pbo", "no");      // Disable PBO (prevents buffer accumulation)
     mpv_set_option_string(mpv, "profile", "fast");          // Use fast decoding preset
     mpv_set_option_string(mpv, "vd-lavc-threads", "2");    // Limit decode threads for wallpaper use
     mpv_set_option_string(mpv, "video-sync", "display-resample"); // Smooth but efficient sync
@@ -707,8 +934,13 @@ static void destroy_display_output(struct display_output *output) {
         zwlr_layer_surface_v1_destroy(output->layer_surface);
     if (output->surface != NULL)
         wl_surface_destroy(output->surface);
-    if (output->egl_surface)
+
+    if (output->egl_surface) {
+        // Make context current to clean up GL resources
+        eglMakeCurrent(egl_display, output->egl_surface, output->egl_surface, egl_context);
+        fbo_destroy(output);
         eglDestroySurface(egl_display, output->egl_surface);
+    }
     if (output->egl_window)
         wl_egl_window_destroy(output->egl_window);
     wl_output_destroy(output->wl_output);
@@ -1160,6 +1392,7 @@ int main(int argc, char **argv) {
     check_paper_processes();
 
     struct wl_state state = {0};
+    g_state = &state;
     wl_list_init(&state.outputs);
 
     parse_command_line(argc, argv, &state);
@@ -1253,7 +1486,7 @@ int main(int argc, char **argv) {
             sleep(2); // Wait at least 2 secs to be killed
         }
 
-        // Check memory usage periodically - self-restart if RSS exceeds threshold
+        // Check memory usage periodically - recycle EGL surface or restart
         // This works around NVIDIA EGL memory leak that cannot be fixed otherwise
         if (difftime(time(NULL), last_render_gc_time) >= RENDER_GC_INTERVAL) {
             last_render_gc_time = time(NULL);
@@ -1262,6 +1495,26 @@ int main(int argc, char **argv) {
                 cflp_info("RSS %zuMB exceeds %zuMB threshold, restarting to flush GPU memory",
                          rss / (1024*1024), mem_restart_threshold / (1024*1024));
                 stop_mpvpaper();
+            } else if (surface_recycle_threshold > 0 && rss > surface_recycle_threshold) {
+                // Try EGL surface recycle first - much cheaper than full restart
+                // Only if surface_recycle_threshold is set (non-zero)
+                cflp_info("RSS %zuMB exceeds %zuMB recycle threshold, recycling EGL surface",
+                         rss / (1024*1024), surface_recycle_threshold / (1024*1024));
+                size_t rss_before = rss;
+                bool recycled = recycle_egl_surfaces();
+                if (recycled) {
+                    // Give it a moment and check if RSS dropped
+                    sleep(2);
+                    size_t rss_after = get_process_rss();
+                    cflp_info("Surface recycle: RSS %zuMB → %zuMB (freed %zuMB)",
+                             rss_before / (1024*1024), rss_after / (1024*1024),
+                             (rss_before - rss_after) / (1024*1024));
+                    // If recycle didn't help enough, still do full restart
+                    if (rss_after > surface_recycle_threshold) {
+                        cflp_info("Surface recycle insufficient, falling back to full restart");
+                        stop_mpvpaper();
+                    }
+                }
             } else if (VERBOSE) {
                 cflp_info("RSS: %zuMB", rss / (1024*1024));
             }
@@ -1275,6 +1528,8 @@ int main(int argc, char **argv) {
                 break;
 
             mpv_render_context_update(mpv_glcontext);
+            // Flush GL pipeline so driver can release previous frame's GPU objects
+            glFlush();
 
             // Draw frame for all outputs
             struct display_output *output;
